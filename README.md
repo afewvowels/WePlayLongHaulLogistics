@@ -31,7 +31,7 @@ Drones that pile up at outposts fly themselves home to the nearest hub, so the f
 - **Spread loads / Fill drones** switch per pad
 - **Weight-based payload:** 100 kg per drone, 250 kg and 500 kg with research
 - **Runway takeoffs, wide banking turns and lined-up landings,** with sounds
-- **Map view:** drones and their routes are drawn on the map, colored by trip type
+- **Map view:** drones show on the map as dots colored by trip type (map setting, on by default)
 - **Power:** 500 kW idle, 1 MW during launches
 - **Circuit network:** set requests from combinators, and read drone statistics on any signals you choose
 - **Multi-surface friendly:** works with Space Age, Space Exploration and other mods with multiple surfaces
@@ -49,7 +49,7 @@ Drones that pile up at outposts fly themselves home to the nearest hub, so the f
 - **Hubs** are pads that supplied another pad in the last 5 minutes. They keep all their drones. Every other pad keeps 2 for return trips and sends the rest home.
 - **Point outpost runways toward your main base** for the quickest approach.
 - **Keep a hub stocked automatically:** wire the pad to an inserter from your drone assembler and enable it when *available drones < 10*.
-- **Fancy flight paths** can be turned off in *Settings → Mod settings → Map* for straight pad-to-pad flights.
+- **Fancy flight paths** can be turned off in *Settings → Mod settings → Map* for straight pad-to-pad flights. **Show drones on the map** is there too.
 
 ### Known limitations
 
