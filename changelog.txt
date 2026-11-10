@@ -1,0 +1,17 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 2026-11-10
+  Features:
+    - Long haul launch pad: a 5x5 rotatable buffer chest with 80 slots that launches cargo drones to other pads, with no range limit.
+    - Requests use the vanilla logistics picker. Anything the pad's local robots can't supply is flown in from other pads.
+    - Cargo drones with loaded and empty models, runway takeoffs, wide banking turns and lined-up landings.
+    - Drone slots like a roboport: 20 drones per pad, up to 40 with research. Mined pads give their drones back.
+    - Fair dispatch: drones are shared round-robin across every pad that needs something, with a 0-255 priority per pad.
+    - Rebalancing: outposts keep 2 drones and send the rest home to the nearest hub.
+    - Spread loads / Fill drones switch per pad. Payload is by item weight: 100 kg, 250 kg or 500 kg with research.
+    - Power: 500 kW idle, 1 MW during launches. Loaded launches pause without power; empty drones can always fly home.
+    - Circuit network: set requests from combinators, and read available, at-pad, inbound and network drone counts on any signals.
+    - Drones and routes show on the map, colored by trip type.
+    - Research: Long haul logistics, plus Long haul cargo capacity 1 and 2.
+    - Mod setting to switch fancy flight paths off for straight pad-to-pad flights.
+    - Works per surface, so it's compatible with Space Age, Space Exploration and other multi-surface mods.
