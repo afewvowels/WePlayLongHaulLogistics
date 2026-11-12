@@ -1,6 +1,6 @@
-# WePlay: Long Haul Logistics
+# WePlay: Long Haul Logistics Drones
 
-**A logistics network with no coverage map.** Swarms of cargo planes link your outposts to your main base, at any distance. It's an alternative to trains for long distance transportation.
+**A logistics network with no coverage map.** Swarms of cargo airplanes link your outposts to your main base, at any distance. It's an alternative to trains for long distance transportation.
 
 - **Mod portal:** https://mods.factorio.com/mod/WePlayLongHaulLogistics
 - **Factorio:** 2.1 (base game; Space Age optional)
@@ -12,16 +12,16 @@
 
 ### What it does
 
-Put a **launch pad** at your main base and another at each outpost. Set requests on the outpost pad like you would on a buffer chest. Anything the outpost's own robots can't supply gets **flown in by cargo drones** from another pad. The cargo lands in the pad's inventory, where local robots can use it for construction, requester chests and personal logistics.
+Put a **launch pad** at your main base and another at each outpost. Set requests on the outpost pad like you would on a buffer chest. Anything the outpost's own robots can't supply gets **flown in by cargo airplanes** from another pad. The cargo lands in the pad's inventory, where local robots can use it for construction, requester chests and personal logistics.
 
-Drones that pile up at outposts fly themselves home to the nearest hub, so the fleet keeps cycling without any babysitting.
+Airplanes that pile up at outposts fly themselves home to the nearest hub, so the fleet keeps cycling without any babysitting.
 
 ### Getting started
 
 1. Research **Long haul logistics** (after Robotics, Electric energy accumulators and Concrete).
 2. Build a **launch pad** inside your main base's robot network, power it, and put some **long haul drones** in it.
 3. Build a **launch pad** at your outpost, power it, and add requests in its logistics section.
-4. Watch the planes take off. ✈️
+4. Watch the airplanes take off. ✈️
 
 ### Features
 
@@ -30,8 +30,8 @@ Drones that pile up at outposts fly themselves home to the nearest hub, so the f
 - **Fair dispatch:** drones are shared round-robin across every pad that needs something, with a **0–255 priority** per pad
 - **Spread loads / Fill drones** switch per pad
 - **Weight-based payload:** 100 kg per drone, 250 kg and 500 kg with research
-- **Runway takeoffs, wide banking turns and lined-up landings,** with sounds
-- **Map view:** drones show on the map as dots colored by trip type (map setting, on by default)
+- **Runway takeoffs, wide banking turns and lined-up landings,** with sounds, and drones visibly roll into their turns
+- **Map view:** drones can show on the map as dots colored by trip type (map setting, off by default)
 - **Power:** 500 kW idle, 1 MW during launches
 - **Circuit network:** set requests from combinators, and read drone statistics on any signals you choose
 - **Multi-surface friendly:** works with Space Age, Space Exploration and other mods with multiple surfaces
@@ -49,7 +49,7 @@ Drones that pile up at outposts fly themselves home to the nearest hub, so the f
 - **Hubs** are pads that supplied another pad in the last 5 minutes. They keep all their drones. Every other pad keeps 2 for return trips and sends the rest home.
 - **Point outpost runways toward your main base** for the quickest approach.
 - **Keep a hub stocked automatically:** wire the pad to an inserter from your drone assembler and enable it when *available drones < 10*.
-- **Fancy flight paths** can be turned off in *Settings → Mod settings → Map* for straight pad-to-pad flights. **Show drones on the map** is there too.
+- **Fancy flight paths** can be turned off in *Settings → Mod settings → Map* for straight pad-to-pad flights. **Show drones on the map** and **Banking turns** are there too.
 
 ### Known limitations
 
@@ -139,6 +139,7 @@ Sprites are rendered in Blender and packed with `tools/pack_sprites.py`, which w
 | `CLIMB_OUT` / `APPROACH` | 15 / 15 tiles | Straight runs after takeoff and before landing |
 | `POWER_IDLE` / `POWER_LAUNCH` | 500 kW / 1 MW | Pad power draw |
 | `POWERED_EMPTY_ONLY` | false | Set to true to require power for empty flights too |
+| `BANK_SQUEEZE` / `BANK_SLIDE` / `BANK_EASE` / `BANK_TILT` | 0.35 / 0.3 / 0.06 / 0.025 | How much the wings narrow, how far the plane slides into the turn, how fast it rolls, and how far the sprite tilts so the lowered wing drops |
 
 ### Contributing
 

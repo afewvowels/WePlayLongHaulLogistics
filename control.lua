@@ -38,6 +38,15 @@ local LAUNCH_DELAY = 60          -- one launch per pad per second, so planes don
 local SPEED = 0.4                -- tiles per tick (24 tiles/s)
 local CRUISE_ALTITUDE = 4        -- tiles
 local CLIMB_DISTANCE = 16        -- tiles to climb to (and descend from) cruise altitude
+
+-- Banking (ported from Radar Probe Drone Launcher): the sprite narrows along
+-- the wings and slides toward the inside of the turn, to fake a roll.
+local BANK_SQUEEZE = 0.35        -- wings shrink by up to 35% at full bank
+local BANK_SLIDE = 0.3           -- tiles the plane slides toward the inside of the turn
+local BANK_EASE = 0.06           -- per tick: how quickly it rolls into and out of a bank
+local BANK_TILT = 0.025          -- turns of sprite rotation at full bank (0.025 = 9 degrees), so the
+                                 -- lowered wing visibly drops on screen in Factorio's tilted view
+local TWO_PI = 2 * math.pi
 local MAP_UPDATE_INTERVAL = 10   -- ticks between map dot moves
 local SOUND_INTERVAL = 28        -- ticks between flying sound loops (clip is ~0.46 s)
 local SOUND_RANGE = 48           -- tiles from a player to hear a drone
@@ -314,6 +323,12 @@ script.on_configuration_changed(function()
   rescan()
   for _, data in pairs(storage.pads) do ensure_companions(data) end
   storage.force_tier = {}
+  storage.show_routes = nil
+  for _, flight in pairs(storage.flights) do
+    -- Route lines were removed in 1.0.1.
+    if flight.map_line and flight.map_line.valid then flight.map_line.destroy() end
+    flight.map_line = nil
+  end
 end)
 
 -- Building -------------------------------------------------------------------
@@ -718,6 +733,10 @@ local function altitude_at(flight, s)
   return CRUISE_ALTITUDE * up * down
 end
 
+local function show_map_dots()
+  return settings.global["wp-long-haul-show-map-drones"].value
+end
+
 local function destroy_renders(flight)
   for _, key in pairs({ "plane", "shadow", "map_dot", "map_line" }) do
     local object = flight[key]
@@ -748,6 +767,7 @@ local function start_flight(surface, start, start_dir, on_runway, dest, cargo, k
     dest_id = dest.id,
     cargo = cargo,
     kind = kind,
+    frame = frame,
   }
   storage.next_flight_id = storage.next_flight_id + 1
 
@@ -776,14 +796,7 @@ local function start_flight(surface, start, start_dir, on_runway, dest, cargo, k
     x_scale = 3,
     y_scale = 3,
     render_mode = "chart",
-  })
-  flight.map_line = rendering.draw_line({
-    color = { color[1] * 0.4, color[2] * 0.4, color[3] * 0.4, 0.4 },
-    width = 2,
-    from = points[1],
-    to = dest_pos,
-    surface = surface,
-    render_mode = "chart",
+    visible = show_map_dots(),
   })
 
   dest.inbound_drones = dest.inbound_drones + 1
@@ -867,7 +880,10 @@ local function land(flight)
     if home then
       start_flight(flight.surface, dest.entity.position, dir_vector(dest.direction), true, home, nil, "return")
     else
-      dest.entity.get_inventory(defines.inventory.chest).insert({ name = DRONE, count = 1 })
+      -- Nowhere to go: park it in the pad's inventory (it docks once a slot frees
+      -- up), or drop it next to the pad if the inventory is full too.
+      local parked = dest.entity.get_inventory(defines.inventory.chest).insert({ name = DRONE, count = 1 })
+      if parked == 0 then spill(flight.surface, flight.to, { name = DRONE, count = 1 }) end
     end
   end
 end
@@ -875,6 +891,7 @@ end
 local function update_flights(tick)
   local landed, rerouted = {}, {}
   local move_map = tick % MAP_UPDATE_INTERVAL == 0
+  local banking = settings.global["wp-long-haul-banking"].value
 
   for id, flight in pairs(storage.flights) do
     if not flight.surface.valid then
@@ -897,18 +914,56 @@ local function update_flights(tick)
       landed[#landed + 1] = flight
       storage.flights[id] = nil
     else
-      local before = flight.segment
       local pos, a, b = path_position(flight)
       local alt = altitude_at(flight, flight.s)
-      if flight.plane.valid then
-        flight.plane.target = { pos.x, pos.y - alt }
-        if flight.segment ~= before then
-          local frame = heading_frame(a, b)
-          flight.plane.animation_offset = frame
+
+      -- Banking: on each new path segment, measure how hard the path turns.
+      -- Arcs at the full turn radius give a full bank (+ right, - left).
+      if flight.segment ~= flight.bank_seg then
+        flight.bank_seg = flight.segment
+        local phi = math.atan2(b.x - a.x, a.y - b.y)
+        local turn = 0
+        if flight.seg_phi then turn = (phi - flight.seg_phi + math.pi) % TWO_PI - math.pi end
+        local length = math.max(0.001, flight.cumulative[flight.segment + 1] - flight.cumulative[flight.segment])
+        flight.bank_target = math.max(-1, math.min(1, turn / length * TURN_RADIUS))
+        flight.seg_phi = phi
+
+        -- Face along the new segment.
+        local frame = heading_frame(a, b)
+        if frame ~= flight.frame then
+          flight.frame = frame
+          if flight.plane.valid then flight.plane.animation_offset = frame end
           if flight.shadow.valid then flight.shadow.animation_offset = frame end
         end
       end
-      if flight.shadow.valid then flight.shadow.target = { pos.x + alt * 0.5, pos.y } end
+      -- Ease toward it, and stay level near the ground (takeoff roll, touchdown).
+      local level = banking and (flight.bank_target or 0) * math.min(1, alt / CRUISE_ALTITUDE) or 0
+      flight.bank = (flight.bank or 0) + (level - (flight.bank or 0)) * BANK_EASE
+
+      -- Squeeze the sprite along the wing axis (screen-axis scales, so diagonal
+      -- headings squeeze a blend of both) and slide it toward the inside of the turn.
+      local sx, sy, ox, oy, tilt = 1, 1, 0, 0, 0
+      local bank = flight.bank
+      if bank > 0.005 or bank < -0.005 then
+        local phi = (flight.frame or 0) / 64 * TWO_PI
+        local wx, wy = math.cos(phi), math.sin(phi) -- wing axis; also "right" of the heading
+        local squeeze = BANK_SQUEEZE * math.abs(bank)
+        sx, sy = 1 - squeeze * wx * wx, 1 - squeeze * wy * wy
+        ox, oy = wx * BANK_SLIDE * bank, wy * BANK_SLIDE * bank
+        -- The lowered wingtip drops down the screen: a clockwise tilt when the
+        -- right wing points east (heading north), counter-clockwise when it
+        -- points west (heading south), and none when the wings run north-south.
+        tilt = BANK_TILT * bank * wx
+      end
+      if flight.plane.valid then
+        flight.plane.target = { pos.x + ox, pos.y - alt + oy }
+        flight.plane.x_scale, flight.plane.y_scale = sx, sy
+        flight.plane.orientation = tilt % 1
+      end
+      if flight.shadow.valid then
+        flight.shadow.target = { pos.x + alt * 0.5 + ox, pos.y + oy }
+        flight.shadow.x_scale, flight.shadow.y_scale = sx, sy
+      end
       if move_map then
         if flight.map_dot.valid then flight.map_dot.target = pos end
         -- Check now and then that the destination still exists.
@@ -948,6 +1003,15 @@ local function play_flying_sounds()
   end
 end
 
+-- The "Show drones on the map" map setting shows or hides every drone dot.
+script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
+  if event.setting ~= "wp-long-haul-show-map-drones" then return end
+  local visible = show_map_dots()
+  for _, flight in pairs(storage.flights) do
+    if flight.map_dot and flight.map_dot.valid then flight.map_dot.visible = visible end
+  end
+end)
+
 -- Launch queue ---------------------------------------------------------------
 
 local function queue_job(data, job)
@@ -964,7 +1028,12 @@ local function launch_next(data)
   if not (dest and dest.entity.valid) then
     -- Destination vanished before takeoff: unload and re-dock.
     data.drones = data.drones + 1
-    if job.cargo then pad.get_inventory(defines.inventory.chest).insert(job.cargo) end
+    if job.cargo then
+      local inserted = pad.get_inventory(defines.inventory.chest).insert(job.cargo)
+      if inserted < job.cargo.count then
+        spill(pad.surface, pad.position, { name = job.cargo.name, quality = job.cargo.quality, count = job.cargo.count - inserted })
+      end
+    end
     return
   end
 
@@ -1241,6 +1310,9 @@ local function refresh_gui(player)
   frame.drone_label.caption = { "wp-long-haul.drones-count", data.drones, drone_capacity(data) }
   frame.traffic_label.caption = { "wp-long-haul.traffic", #data.queue, data.inbound_drones }
   frame.power_label.caption = is_powered(data) and { "wp-long-haul.power-ok" } or { "wp-long-haul.power-low" }
+  local network = data.entity.logistic_network
+  frame.network_label.caption = network and { "wp-long-haul.network-in" } or { "wp-long-haul.network-out" }
+  frame.network_label.tooltip = network and { "wp-long-haul.network-in-tooltip" } or { "wp-long-haul.network-out-tooltip" }
   frame.role_label.caption = is_hub(data) and { "wp-long-haul.role-hub" } or { "wp-long-haul.role-outpost", RESERVE_DRONES }
   local slots = frame.drone_slots
   local left = data.drones
@@ -1279,6 +1351,7 @@ local function build_gui(player, data)
   frame.add({ type = "label", name = "drone_label", style = "caption_label" })
   frame.add({ type = "label", name = "traffic_label" })
   frame.add({ type = "label", name = "power_label" })
+  frame.add({ type = "label", name = "network_label" })
   local role = frame.add({ type = "label", name = "role_label", tooltip = { "wp-long-haul.role-tooltip" } })
   role.style.single_line = false
   role.style.maximal_width = 220

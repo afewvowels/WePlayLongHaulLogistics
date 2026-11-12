@@ -1,4 +1,25 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.0.2
+Date: 2026-11-12
+  Features:
+    - Banking turns: drones visibly roll into their turns. The wings narrow, the lowered wing dips, and the plane slides toward the inside of the turn. Can be turned off with the new "Banking turns" map setting.
+  Changes:
+    - Renamed to "WePlay: Long Haul Logistics Drones".
+    - Launch pads no longer show the "not in a logistic network" warning, since pads connect to each other at any range.
+    - The pad panel now shows whether the pad is inside a robot network.
+    - "Show drones on the map" is now off by default.
+  Graphics:
+    - New mod thumbnail with the cargo biplanes.
+---------------------------------------------------------------------------------------------------
+Version: 1.0.1
+Date: 2026-11-10
+  Changes:
+    - Removed the drone route lines from the map.
+    - New map setting "Show drones on the map" (on by default) to show or hide the drone dots in map view.
+  Bugfixes:
+    - Drones with nowhere to dock no longer vanish when their pad's inventory is full; they drop next to the pad instead.
+    - Cargo waiting on a runway no longer vanishes if its destination is removed and the pad is full; it drops next to the pad instead.
+---------------------------------------------------------------------------------------------------
 Version: 1.0.0
 Date: 2026-11-10
   Features:

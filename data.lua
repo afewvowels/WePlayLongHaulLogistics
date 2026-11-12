@@ -102,6 +102,8 @@ for frame, dir in pairs(DIRECTIONS) do
     {
       type = "logistic-container",
       logistic_mode = "buffer",
+      -- Pads link up with each other at any range, so no "not in a logistic network" warning.
+      render_not_in_network_icon = false,
       name = "wp-long-haul-pad-" .. dir,
       localised_name = { "entity-name.wp-long-haul-pad" },
       localised_description = { "entity-description.wp-long-haul-pad" },
