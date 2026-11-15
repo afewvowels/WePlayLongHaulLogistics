@@ -34,20 +34,7 @@ local DISPATCH_INTERVAL = 60     -- ticks between dispatch passes
 local REBALANCE_INTERVAL = 300   -- ticks between rebalancing passes
 local LAUNCH_DELAY = 60          -- one launch per pad per second, so planes don't overlap
 
--- Flight
-local SPEED = 0.4                -- tiles per tick (24 tiles/s)
-local CRUISE_ALTITUDE = 4        -- tiles
-local CLIMB_DISTANCE = 16        -- tiles to climb to (and descend from) cruise altitude
-
--- Banking (ported from Radar Probe Drone Launcher): the sprite narrows along
--- the wings and slides toward the inside of the turn, to fake a roll.
-local BANK_SQUEEZE = 0.35        -- wings shrink by up to 35% at full bank
-local BANK_SLIDE = 0.3           -- tiles the plane slides toward the inside of the turn
-local BANK_EASE = 0.06           -- per tick: how quickly it rolls into and out of a bank
-local BANK_TILT = 0.025          -- turns of sprite rotation at full bank (0.025 = 9 degrees), so the
-                                 -- lowered wing visibly drops on screen in Factorio's tilted view
-local TWO_PI = 2 * math.pi
-local MAP_UPDATE_INTERVAL = 10   -- ticks between map dot moves
+-- Flight (speeds, turn radius, banking and so on are WePlay Flight Library defaults)
 local SOUND_INTERVAL = 28        -- ticks between flying sound loops (clip is ~0.46 s)
 local SOUND_RANGE = 48           -- tiles from a player to hear a drone
 local MAX_SOUNDS = 6             -- flying sounds per loop, so a swarm doesn't get deafening
@@ -352,10 +339,52 @@ local function swap_placer(placer, player_index, tags)
   if pad then register_pad(pad, tags) end
 end
 
+-- Optional limit on pads per force (map setting, 0 = no limit), for performance.
+local function pad_count(force)
+  local n = 0
+  for _, data in pairs(storage.pads) do
+    if data.entity.valid and data.entity.force == force then n = n + 1 end
+  end
+  return n
+end
+
+-- Over the limit: remove the new pad and hand the item back (to the player, or
+-- on the ground marked for pickup when a robot built it).
+local function refuse_pad(placer, event, limit)
+  local surface, position, force = placer.surface, placer.position, placer.force
+  local item = { name = "wp-long-haul-pad", count = 1, quality = placer.quality.name }
+  placer.destroy()
+  local player = event.player_index and game.get_player(event.player_index)
+  local message = { "wp-long-haul.pad-limit", limit }
+  if player and player.insert(item) > 0 then
+    player.create_local_flying_text({ text = message, position = position })
+    return
+  end
+  local spilled = surface.spill_item_stack({ position = position, stack = item, enable_looted = true, force = force })
+  for _, e in pairs(spilled or {}) do
+    if e.valid then e.order_deconstruction(force) end
+  end
+  rendering.draw_text({
+    text = message, surface = surface, target = position, color = { 1, 0.4, 0.3 },
+    scale = 1.2, alignment = "center", time_to_live = 300, forces = { force },
+  })
+end
+
+local LIMITED_BUILDS = {
+  [defines.events.on_built_entity] = true,
+  [defines.events.on_robot_built_entity] = true,
+  [defines.events.on_space_platform_built_entity] = true,
+}
+
 local function on_built(event)
   local entity = event.entity
   if not (entity and entity.valid) then return end
   if entity.name == PLACER then
+    local limit = settings.global["wp-long-haul-max-pads"].value
+    if limit > 0 and LIMITED_BUILDS[event.name] and pad_count(entity.force) >= limit then
+      refuse_pad(entity, event, limit)
+      return
+    end
     swap_placer(entity, event.player_index, event.tags)
   elseif is_pad(entity) and not get_pad_data(entity) then
     register_pad(entity, event.tags)
@@ -568,252 +597,172 @@ local function strip_drone_requests(data)
 end
 
 -- Flights --------------------------------------------------------------------
--- A flight follows a path of points. With fancy flights on, that's a takeoff
--- roll down the origin runway, a curved turn toward the destination, a
--- straight final approach lined up with the destination runway, and a landing
--- roll. With it off, it's a straight line from pad to pad.
+-- Flying is done by WePlay Flight Library. Each drone in the air is one flight
+-- table in storage.flights: the library's fields (mode, pos, heading, bank,
+-- render objects...) plus Long Haul's own: id, dest_id, cargo, kind, to, and
+-- the alt-mode cargo icon.
 
-local RUNWAY_BACK = 1.5    -- tiles from pad center to the tower end
-local RUNWAY_FRONT = 2.5   -- tiles from pad center to the stripe end
-local CLIMB_OUT = 15       -- straight climb-out past the runway before turning, in tiles
-local APPROACH = 15        -- straight final approach length, in tiles
-local TURN_RADIUS = 20     -- tightest turn a drone makes, in tiles (bigger = lazier arcs)
+local Flight = require("__WePlayFlightLib__/flight")
 
-local function fancy_flights()
-  return settings.global["wp-long-haul-fancy-flights"].value
-end
+local RENDER_RANGE = 160    -- tiles: drones further than this from every player aren't redrawn
+local CULL_INTERVAL = 15    -- ticks between "is anyone close enough to see it?" checks per drone
+local DEST_CHECK = 10       -- ticks between checks that a drone's destination pad still exists
+local DRONE_ANIM = "wp-long-haul-drone-" -- + "loaded" / "unloaded" (+ "-shadow")
 
-local function dir_vector(direction)
-  local o = direction / 16 * 2 * math.pi
-  return { x = math.sin(o), y = -math.cos(o) }
-end
-
-local function offset(p, dir, k)
-  return { x = p.x + dir.x * k, y = p.y + dir.y * k }
-end
-
-local function heading_frame(from, to)
-  -- Factorio orientation: 0 = north, clockwise. 64 frames.
-  local orientation = math.atan2(to.x - from.x, from.y - to.y) / (2 * math.pi)
-  return math.floor(orientation * 64 + 0.5) % 64
-end
-
-local function smoothstep(t)
-  if t <= 0 then return 0 end
-  if t >= 1 then return 1 end
-  return t * t * (3 - 2 * t)
-end
-
--- Turn-radius paths ("Dubins paths"): arc, straight, arc, where every arc has
--- radius TURN_RADIUS. Picks the shortest of the four left/right combinations.
--- Directions are unit vectors in map coordinates (y points south).
-local TAU = 2 * math.pi
-local function phi_of(d) return math.atan2(d.x, -d.y) end -- 0 = north, clockwise
-local function left_of(d) return { x = d.y, y = -d.x } end
-local function right_of(d) return { x = -d.y, y = d.x } end
-
-local function side_normal(d, side) return side == "L" and left_of(d) or right_of(d) end
-
-local function turn_delta(from_phi, to_phi, side)
-  if side == "R" then return (to_phi - from_phi) % TAU end
-  return (from_phi - to_phi) % TAU
-end
-
-local function add_turn_path(points, p0, d0, p1, d1)
-  local R = TURN_RADIUS
-  local best
-  for _, a_side in pairs({ "L", "R" }) do
-    for _, b_side in pairs({ "L", "R" }) do
-      local c0 = offset(p0, side_normal(d0, a_side), R)
-      local c1 = offset(p1, side_normal(d1, b_side), R)
-      local wx, wy = c1.x - c0.x, c1.y - c0.y
-      local dist = math.sqrt(wx * wx + wy * wy)
-      local straight, s
-      if a_side == b_side then
-        if dist < 1e-6 then s, straight = d0, 0 else s, straight = { x = wx / dist, y = wy / dist }, dist end
-      elseif dist >= 2 * R then
-        straight = math.sqrt(dist * dist - 4 * R * R)
-        local w = { x = wx / dist, y = wy / dist }
-        local angle = math.atan2(2 * R, straight) * (a_side == "L" and 1 or -1)
-        local n = left_of(w)
-        s = { x = w.x * math.cos(angle) + n.x * math.sin(angle), y = w.y * math.cos(angle) + n.y * math.sin(angle) }
-      end
-      if s then
-        local phi0, phis, phi1 = phi_of(d0), phi_of(s), phi_of(d1)
-        local turn0, turn1 = turn_delta(phi0, phis, a_side), turn_delta(phis, phi1, b_side)
-        local length = R * turn0 + straight + R * turn1
-        if not best or length < best.length then
-          best = { length = length, a = a_side, b = b_side, c0 = c0, c1 = c1, s = s,
-                   phi0 = phi0, phis = phis, turn0 = turn0, turn1 = turn1 }
-        end
-      end
-    end
-  end
-
-  -- Points every ~2 tiles around each arc; the straight is just its end point.
-  local function arc(center, side, start_phi, delta)
-    local steps = math.max(1, math.ceil(R * delta / 2))
-    local k = side == "L" and 1 or -1
-    for i = 1, steps do
-      local phi = start_phi + (side == "R" and 1 or -1) * delta * i / steps
-      points[#points + 1] = { x = center.x + k * R * math.cos(phi), y = center.y + k * R * math.sin(phi) }
-    end
-  end
-  arc(best.c0, best.a, best.phi0, best.turn0)
-  points[#points + 1] = offset(best.c1, side_normal(best.s, best.b), -R) -- start of the second arc
-  arc(best.c1, best.b, best.phis, best.turn1)
-end
-
--- start: where the drone is; start_dir: a direction vector it's facing;
--- on_runway: true when it starts parked on a pad (adds the takeoff roll).
-local function build_path(start, start_dir, on_runway, dest_pos, dest_direction)
-  local points = {}
-  local roll_up, roll_down = 0, 0
-
-  if not fancy_flights() then
-    points[1] = { x = start.x, y = start.y }
-    points[2] = { x = dest_pos.x, y = dest_pos.y }
-  else
-    local v = dir_vector(dest_direction)
-    local p0
-    if on_runway then
-      points[1] = offset(start, start_dir, -RUNWAY_BACK) -- tower end
-      points[2] = offset(start, start_dir, RUNWAY_FRONT) -- lift off past the stripes
-      points[3] = offset(points[2], start_dir, CLIMB_OUT) -- climb straight out
-      p0 = points[3]
-    else
-      points[1] = { x = start.x, y = start.y }
-      p0 = points[1]
-    end
-    -- Land on the stripe end heading toward the tower, so approach from beyond it.
-    local touchdown = offset(dest_pos, v, RUNWAY_FRONT)
-    local final = offset(touchdown, v, APPROACH)
-    add_turn_path(points, p0, start_dir, final, { x = -v.x, y = -v.y })
-    points[#points + 1] = touchdown
-    points[#points + 1] = offset(dest_pos, v, -RUNWAY_BACK) -- roll to a stop by the tower
-  end
-
-  local cumulative = { 0 }
-  for i = 2, #points do
-    local dx, dy = points[i].x - points[i - 1].x, points[i].y - points[i - 1].y
-    cumulative[i] = cumulative[i - 1] + math.sqrt(dx * dx + dy * dy)
-  end
-  local total = cumulative[#points]
-  if fancy_flights() then
-    if on_runway then roll_up = cumulative[2] end
-    roll_down = total - cumulative[#points - 1]
-  end
-  return points, cumulative, total, roll_up, roll_down
-end
-
--- Speed ramps up on the takeoff roll and down on the approach and landing roll.
-local function speed_at(flight, s)
-  local up
-  if s < flight.roll_up then
-    up = 0.05 + 0.2 * (s / flight.roll_up)
-  else
-    up = math.min(SPEED, 0.25 + (SPEED - 0.25) * (s - flight.roll_up) / 10)
-  end
-  local r = flight.total - s
-  local down
-  if r < flight.roll_down then
-    down = 0.04 + 0.16 * (r / flight.roll_down)
-  else
-    down = math.min(SPEED, 0.2 + (SPEED - 0.2) * (r - flight.roll_down) / 12)
-  end
-  return math.max(0.03, math.min(up, down))
-end
-
-local function altitude_at(flight, s)
-  local air = flight.total - flight.roll_up - flight.roll_down
-  if air <= 0 then return 0 end
-  local climb = math.min(CLIMB_DISTANCE, air / 2)
-  local up = smoothstep((s - flight.roll_up) / climb)
-  local down = smoothstep((flight.total - flight.roll_down - s) / climb)
-  return CRUISE_ALTITUDE * up * down
-end
-
-local function show_map_dots()
-  return settings.global["wp-long-haul-show-map-drones"].value
-end
-
-local function destroy_renders(flight)
-  for _, key in pairs({ "plane", "shadow", "map_dot", "map_line" }) do
-    local object = flight[key]
-    if object and object.valid then object.destroy() end
-  end
-end
-
--- Start a drone flying to a pad. Counts it as inbound there.
-local function start_flight(surface, start, start_dir, on_runway, dest, cargo, kind)
-  local dest_pos = dest.entity.position
-  local points, cumulative, total, roll_up, roll_down =
-    build_path(start, start_dir, on_runway, dest_pos, dest.direction)
-  local variant = cargo and "loaded" or "unloaded"
-  local frame = heading_frame(points[1], points[2])
-  local color = COLOR[kind] or COLOR.delivery
-
-  local flight = {
-    id = storage.next_flight_id,
-    surface = surface,
-    points = points,
-    cumulative = cumulative,
-    total = total,
-    roll_up = roll_up,
-    roll_down = roll_down,
-    s = 0,
-    segment = 1,
-    to = { x = dest_pos.x, y = dest_pos.y },
-    dest_id = dest.id,
-    cargo = cargo,
-    kind = kind,
-    frame = frame,
+-- Settings and sprite info, read once and refreshed when settings change.
+local cfg
+local function get_cfg()
+  if cfg then return cfg end
+  local g = settings.global
+  cfg = {
+    fancy = g["wp-long-haul-fancy-flights"].value,
+    map_dots = g["wp-long-haul-show-map-drones"].value,
+    banking = g["wp-long-haul-banking"].value,
+    max_pads = g["wp-long-haul-max-pads"].value,
+    traffic = g["wp-long-haul-traffic-pattern"].value,
   }
-  storage.next_flight_id = storage.next_flight_id + 1
-
-  -- Shadow first so the plane always draws on top of it.
-  flight.shadow = rendering.draw_animation({
-    animation = "wp-long-haul-drone-" .. variant .. "-shadow",
-    animation_speed = 0,
-    animation_offset = frame,
-    target = points[1],
-    surface = surface,
-    render_layer = "air-object",
-  })
-  flight.plane = rendering.draw_animation({
-    animation = "wp-long-haul-drone-" .. variant,
-    animation_speed = 0,
-    animation_offset = frame,
-    target = points[1],
-    surface = surface,
-    render_layer = "air-object",
-  })
-  flight.map_dot = rendering.draw_sprite({
-    sprite = "item/" .. DRONE,
-    target = points[1],
-    surface = surface,
-    tint = color,
-    x_scale = 3,
-    y_scale = 3,
-    render_mode = "chart",
-    visible = show_map_dots(),
-  })
-
-  dest.inbound_drones = dest.inbound_drones + 1
-  storage.flights[flight.id] = flight
-  return flight
+  -- Rendered bank frames, if the sheets are in the mod: one animation per bank,
+  -- "wp-long-haul-drone-loaded-0" (hard left) ... "-4" (hard right).
+  local info = prototypes.mod_data["wp-long-haul"]
+  cfg.banks = info and info.data.banks or 1
+  -- pack_drone_sprites.py names bank animations "<name>-hull-<n>" / "<name>-shadow-<n>".
+  cfg.body_suffix = cfg.banks > 1 and "-hull" or ""
+  return cfg
 end
 
--- Where the drone is now and which way it's heading, along its path.
-local function path_position(flight)
-  local points, cumulative = flight.points, flight.cumulative
-  local i = flight.segment
-  while i < #points - 1 and cumulative[i + 1] <= flight.s do i = i + 1 end
-  flight.segment = i
-  local a, b = points[i], points[i + 1]
-  local length = cumulative[i + 1] - cumulative[i]
-  local t = length > 0 and (flight.s - cumulative[i]) / length or 1
-  return { x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t }, a, b
+local function flight_options(surface, position, direction, cargo, kind)
+  local c = get_cfg()
+  local name = DRONE_ANIM .. (cargo and "loaded" or "unloaded")
+  return {
+    surface = surface,
+    position = position,
+    direction = direction,
+    sprites = { body = name .. c.body_suffix, shadow = name .. "-shadow" },
+    map = { sprite = "item/" .. DRONE, tint = COLOR[kind] or COLOR.delivery, scale = 3, visible = c.map_dots },
+    banks = c.banks,
+    split_banks = c.banks > 1,
+    banking_off = not c.banking,
+  }
+end
+
+-- Alt-mode icon of the cargo, riding along above the drone.
+local ICON_BACKGROUND = "utility/entity_info_dark_background"
+local function add_cargo_icon(f)
+  local cargo = f.cargo
+  if not cargo then return end
+  local target = Flight.air(f)
+  if helpers.is_valid_sprite_path(ICON_BACKGROUND) then
+    f.r_icon_bg = rendering.draw_sprite({
+      sprite = ICON_BACKGROUND, target = target, surface = f.surface,
+      x_scale = 0.5, y_scale = 0.5, only_in_alt_mode = true, render_layer = "air-entity-info-icon",
+    })
+  end
+  f.r_icon = rendering.draw_sprite({
+    sprite = "item/" .. cargo.name, target = target, surface = f.surface,
+    x_scale = 0.45, y_scale = 0.45, only_in_alt_mode = true, render_layer = "air-entity-info-icon",
+  })
+  if cargo.quality and cargo.quality ~= "normal" and helpers.is_valid_sprite_path("quality/" .. cargo.quality) then
+    f.r_icon_quality = rendering.draw_sprite({
+      sprite = "quality/" .. cargo.quality, target = target, surface = f.surface,
+      x_scale = 0.2, y_scale = 0.2, only_in_alt_mode = true, render_layer = "air-entity-info-icon",
+    })
+  end
+end
+
+local ICON_KEYS = { "r_icon_bg", "r_icon", "r_icon_quality" }
+
+local function move_cargo_icon(f)
+  if not f.r_icon then return end
+  local air = Flight.air(f)
+  for _, key in pairs(ICON_KEYS) do
+    local r = f[key]
+    if r and r.valid then
+      if key == "r_icon_quality" then r.target = { x = air.x - 0.22, y = air.y + 0.22 } else r.target = air end
+    end
+  end
+end
+
+-- Drones far from every player are hidden and not redrawn: the library skips
+-- render objects that aren't on the flight table, so park them in f.held.
+local DRAWN_KEYS = { "r_body", "r_shadow", "r_glow" }
+
+local function set_drawn(f, drawn)
+  if (not f.hidden) == drawn then return end
+  if drawn then
+    for key, r in pairs(f.held or {}) do
+      f[key] = r
+      if r.valid then
+        r.visible = true
+        if f.split_banks and f.anim[key] then r.animation = f.anim[key] .. "-" .. f.bank_index end
+      end
+    end
+    f.held, f.hidden = nil, nil
+    f.frame = -1 -- refresh the heading frame on the next redraw
+  else
+    f.held = {}
+    for _, key in pairs(DRAWN_KEYS) do
+      local r = f[key]
+      if r then
+        f.held[key] = r
+        if r.valid then r.visible = false end
+        f[key] = nil
+      end
+    end
+    f.hidden = true
+  end
+  for _, key in pairs(ICON_KEYS) do
+    local r = f[key]
+    if r and r.valid then r.visible = drawn end
+  end
+  if drawn then move_cargo_icon(f) end
+end
+
+local function destroy_flight(f)
+  if f.held then
+    for key, r in pairs(f.held) do f[key] = r end
+    f.held = nil
+  end
+  Flight.destroy(f)
+  for _, key in pairs(ICON_KEYS) do
+    local r = f[key]
+    if r and r.valid then r.destroy() end
+    f[key] = nil
+  end
+end
+
+-- Track a new flight heading for `dest`. Counts it as inbound there.
+local function register_flight(f, dest, cargo, kind)
+  f.id = storage.next_flight_id
+  storage.next_flight_id = storage.next_flight_id + 1
+  f.dest_id = dest.id
+  f.cargo = cargo
+  f.kind = kind
+  local to = dest.entity.position
+  f.to = { x = to.x, y = to.y }
+  dest.inbound_drones = dest.inbound_drones + 1
+  add_cargo_icon(f)
+  storage.flights[f.id] = f
+  return f
+end
+
+-- Traffic pattern: departures and arrivals both turn right, which puts them on
+-- opposite circles around every pad (departures climb out and turn off to one
+-- side, arrivals swing in from the other), so the two streams don't overlap.
+local TRAFFIC_TURN = "R"
+
+-- Take off from a pad's runway and fly to land on another pad.
+local function launch_flight(origin, dest, cargo, kind)
+  local c = get_cfg()
+  local pad = origin.entity
+  local f = Flight.new(flight_options(pad.surface, pad.position, origin.direction, cargo, kind))
+  Flight.fly_to_pad(f, dest.entity.position, Flight.dir_vector(dest.direction), {
+    from_pad = pad.position,
+    from_dir = Flight.dir_vector(origin.direction),
+    straight = not c.fancy,
+    first_turn = c.traffic and TRAFFIC_TURN or nil,
+    last_turn = c.traffic and TRAFFIC_TURN or nil,
+  })
+  return register_flight(f, dest, cargo, kind)
 end
 
 -- Nearest pad on a surface with a free drone slot.
@@ -832,183 +781,148 @@ local function spill(surface, position, stack)
   surface.spill_item_stack({ position = position, stack = stack, enable_looted = true })
 end
 
--- The destination vanished: fly on (from wherever the drone is) to the nearest
--- pad with room, cargo and all. Nothing anywhere? Drop everything.
-local function reroute(flight, position, heading)
-  local fallback = nearest_with_room(flight.surface, position)
-  if fallback then
-    if flight.cargo then
-      local key = item_key(flight.cargo.name, flight.cargo.quality)
-      fallback.inbound[key] = (fallback.inbound[key] or 0) + flight.cargo.count
-    end
-    start_flight(flight.surface, position, heading, false, fallback, flight.cargo, "reroute")
-  else
-    if flight.cargo then spill(flight.surface, position, flight.cargo) end
-    spill(flight.surface, position, { name = DRONE, count = 1 })
-  end
-end
-
-local function land(flight)
-  destroy_renders(flight)
-  local dest = storage.pads[flight.dest_id]
-
-  if not (dest and dest.entity.valid) then
-    local n = #flight.points
-    local a, b = flight.points[n - 1], flight.points[n]
-    local length = math.max(0.001, math.sqrt(distance_sq(a, b)))
-    reroute(flight, b, { x = (b.x - a.x) / length, y = (b.y - a.y) / length })
+-- The destination vanished: turn (in the air) toward the nearest pad with room,
+-- cargo and all. Nothing anywhere? Drop everything where the drone is.
+local function reroute(f)
+  local pos = Flight.ground(f)
+  local fallback = nearest_with_room(f.surface, pos)
+  if not fallback then
+    if f.cargo then spill(f.surface, pos, f.cargo) end
+    spill(f.surface, pos, { name = DRONE, count = 1 })
+    destroy_flight(f)
+    storage.flights[f.id] = nil
     return
   end
+  if f.cargo then
+    local key = item_key(f.cargo.name, f.cargo.quality)
+    fallback.inbound[key] = (fallback.inbound[key] or 0) + f.cargo.count
+  end
+  fallback.inbound_drones = fallback.inbound_drones + 1
+  f.dest_id, f.kind = fallback.id, "reroute"
+  local to = fallback.entity.position
+  f.to = { x = to.x, y = to.y }
+  local c = get_cfg()
+  Flight.fly_to_pad(f, to, Flight.dir_vector(fallback.direction), {
+    straight = not c.fancy,
+    last_turn = c.traffic and TRAFFIC_TURN or nil,
+  })
+  if f.r_map and f.r_map.valid then f.r_map.color = COLOR.reroute end
+end
 
+-- Unload at the destination, then dock, or take off again empty if it's full.
+local function arrive(f, dest)
   dest.inbound_drones = dest.inbound_drones - 1
 
-  if flight.cargo then
-    local cargo = flight.cargo
+  if f.cargo then
+    local cargo = f.cargo
     local key = item_key(cargo.name, cargo.quality)
     dest.inbound[key] = math.max(0, (dest.inbound[key] or 0) - cargo.count)
     local inserted = dest.entity.get_inventory(defines.inventory.chest).insert(cargo)
     if inserted < cargo.count then
-      spill(flight.surface, flight.to, { name = cargo.name, quality = cargo.quality, count = cargo.count - inserted })
+      spill(f.surface, f.to, { name = cargo.name, quality = cargo.quality, count = cargo.count - inserted })
     end
   end
 
-  -- Dock if there's a free slot, otherwise take off again, empty.
   if dest.drones < drone_capacity(dest) then
     dest.drones = dest.drones + 1
   else
-    local home = nearest_with_room(flight.surface, flight.to, dest.id)
+    local home = nearest_with_room(f.surface, f.to, dest.id)
     if home then
-      start_flight(flight.surface, dest.entity.position, dir_vector(dest.direction), true, home, nil, "return")
+      launch_flight(dest, home, nil, "return")
     else
       -- Nowhere to go: park it in the pad's inventory (it docks once a slot frees
       -- up), or drop it next to the pad if the inventory is full too.
       local parked = dest.entity.get_inventory(defines.inventory.chest).insert({ name = DRONE, count = 1 })
-      if parked == 0 then spill(flight.surface, flight.to, { name = DRONE, count = 1 }) end
+      if parked == 0 then spill(f.surface, f.to, { name = DRONE, count = 1 }) end
     end
+  end
+end
+
+-- A flight saved by Long Haul 1.0.x (before the flight library): finish it at once.
+local function finish_old_flight(f)
+  for _, key in pairs({ "plane", "shadow", "map_dot", "map_line" }) do
+    local r = f[key]
+    if r and r.valid then r.destroy() end
+  end
+  local dest = storage.pads[f.dest_id]
+  if dest and dest.entity.valid then
+    arrive(f, dest)
+  else
+    if f.cargo then spill(f.surface, f.to, f.cargo) end
+    spill(f.surface, f.to, { name = DRONE, count = 1 })
   end
 end
 
 local function update_flights(tick)
-  local landed, rerouted = {}, {}
-  local move_map = tick % MAP_UPDATE_INTERVAL == 0
-  local banking = settings.global["wp-long-haul-banking"].value
+  local c = get_cfg()
+  local banking_off = not c.banking
 
-  for id, flight in pairs(storage.flights) do
-    if not flight.surface.valid then
-      -- Its surface was deleted (Space Exploration and others do this); drop it.
-      destroy_renders(flight)
+  -- Where players are, per surface, for culling far-away drones.
+  local viewers = {}
+  for _, player in pairs(game.connected_players) do
+    local index = player.surface_index
+    viewers[index] = viewers[index] or {}
+    table.insert(viewers[index], player.position)
+  end
+  local range_sq = RENDER_RANGE * RENDER_RANGE
+  local check_dest = tick % DEST_CHECK == 0
+  local landed, rerouted, old = {}, {}, {}
+
+  for id, f in pairs(storage.flights) do
+    if not f.mode then
+      old[#old + 1] = f
       storage.flights[id] = nil
-      goto continue
-    end
-    if not flight.points then
-      -- A straight 0.4.0 flight: give it a two-point path from where it started.
-      local from = flight.from or flight.to
-      flight.points = { from, flight.to }
-      flight.cumulative = { 0, math.sqrt(distance_sq(from, flight.to)) }
-      flight.total = math.max(0.001, flight.cumulative[2])
-      flight.roll_up, flight.roll_down, flight.segment = 0, 0, 1
-      flight.s = flight.duration and math.min(1, (tick - flight.start) / flight.duration) * flight.total or 0
-    end
-    flight.s = flight.s + speed_at(flight, flight.s)
-    if flight.s >= flight.total then
-      landed[#landed + 1] = flight
+    elseif not f.surface.valid then
+      -- Its surface was deleted (Space Exploration and others do this); drop it.
+      destroy_flight(f)
       storage.flights[id] = nil
     else
-      local pos, a, b = path_position(flight)
-      local alt = altitude_at(flight, flight.s)
-
-      -- Banking: on each new path segment, measure how hard the path turns.
-      -- Arcs at the full turn radius give a full bank (+ right, - left).
-      if flight.segment ~= flight.bank_seg then
-        flight.bank_seg = flight.segment
-        local phi = math.atan2(b.x - a.x, a.y - b.y)
-        local turn = 0
-        if flight.seg_phi then turn = (phi - flight.seg_phi + math.pi) % TWO_PI - math.pi end
-        local length = math.max(0.001, flight.cumulative[flight.segment + 1] - flight.cumulative[flight.segment])
-        flight.bank_target = math.max(-1, math.min(1, turn / length * TURN_RADIUS))
-        flight.seg_phi = phi
-
-        -- Face along the new segment.
-        local frame = heading_frame(a, b)
-        if frame ~= flight.frame then
-          flight.frame = frame
-          if flight.plane.valid then flight.plane.animation_offset = frame end
-          if flight.shadow.valid then flight.shadow.animation_offset = frame end
+      f.banking_off = banking_off
+      if (tick + id) % CULL_INTERVAL == 0 then
+        local near = false
+        for _, pos in pairs(viewers[f.surface.index] or {}) do
+          local dx, dy = pos.x - f.pos.x, pos.y - f.pos.y
+          if dx * dx + dy * dy < range_sq then near = true break end
         end
+        set_drawn(f, near)
       end
-      -- Ease toward it, and stay level near the ground (takeoff roll, touchdown).
-      local level = banking and (flight.bank_target or 0) * math.min(1, alt / CRUISE_ALTITUDE) or 0
-      flight.bank = (flight.bank or 0) + (level - (flight.bank or 0)) * BANK_EASE
 
-      -- Squeeze the sprite along the wing axis (screen-axis scales, so diagonal
-      -- headings squeeze a blend of both) and slide it toward the inside of the turn.
-      local sx, sy, ox, oy, tilt = 1, 1, 0, 0, 0
-      local bank = flight.bank
-      if bank > 0.005 or bank < -0.005 then
-        local phi = (flight.frame or 0) / 64 * TWO_PI
-        local wx, wy = math.cos(phi), math.sin(phi) -- wing axis; also "right" of the heading
-        local squeeze = BANK_SQUEEZE * math.abs(bank)
-        sx, sy = 1 - squeeze * wx * wx, 1 - squeeze * wy * wy
-        ox, oy = wx * BANK_SLIDE * bank, wy * BANK_SLIDE * bank
-        -- The lowered wingtip drops down the screen: a clockwise tilt when the
-        -- right wing points east (heading north), counter-clockwise when it
-        -- points west (heading south), and none when the wings run north-south.
-        tilt = BANK_TILT * bank * wx
-      end
-      if flight.plane.valid then
-        flight.plane.target = { pos.x + ox, pos.y - alt + oy }
-        flight.plane.x_scale, flight.plane.y_scale = sx, sy
-        flight.plane.orientation = tilt % 1
-      end
-      if flight.shadow.valid then
-        flight.shadow.target = { pos.x + alt * 0.5 + ox, pos.y + oy }
-        flight.shadow.x_scale, flight.shadow.y_scale = sx, sy
-      end
-      if move_map then
-        if flight.map_dot.valid then flight.map_dot.target = pos end
-        -- Check now and then that the destination still exists.
-        local dest = storage.pads[flight.dest_id]
-        if not (dest and dest.entity.valid) then
-          local length = math.max(0.001, math.sqrt(distance_sq(a, b)))
-          rerouted[#rerouted + 1] = { flight, pos, { x = (b.x - a.x) / length, y = (b.y - a.y) / length } }
-          storage.flights[id] = nil
-        end
-      end
-    end
-    ::continue::
-  end
-
-  -- Landing and rerouting start new flights, so do them after walking the table.
-  for _, flight in pairs(landed) do land(flight) end
-  for _, r in pairs(rerouted) do
-    destroy_renders(r[1])
-    reroute(r[1], r[2], r[3])
-  end
-end
-
--- Loop the short flying sound for drones near players, a few at a time.
-local function play_flying_sounds()
-  local played = 0
-  for _, player in pairs(game.connected_players) do
-    for _, flight in pairs(storage.flights) do
-      if played >= MAX_SOUNDS then return end
-      if flight.surface.valid and flight.surface == player.surface and flight.plane.valid then
-        local pos = flight.plane.target.position
-        if pos and distance_sq(pos, player.position) < SOUND_RANGE * SOUND_RANGE then
-          flight.surface.play_sound({ path = "wp-long-haul-drone-flying", position = pos })
-          played = played + 1
+      local event = Flight.step(f)
+      if event == "landed" then
+        landed[#landed + 1] = f
+      else
+        if not f.hidden then move_cargo_icon(f) end
+        if check_dest then
+          local dest = storage.pads[f.dest_id]
+          if not (dest and dest.entity.valid) then rerouted[#rerouted + 1] = f end
         end
       end
     end
   end
+
+  -- These can start new flights, so do them after walking the table.
+  for _, f in pairs(old) do finish_old_flight(f) end
+  for _, f in pairs(rerouted) do reroute(f) end
+  for _, f in pairs(landed) do
+    local dest = storage.pads[f.dest_id]
+    if dest and dest.entity.valid then
+      destroy_flight(f)
+      storage.flights[f.id] = nil
+      arrive(f, dest)
+    else
+      reroute(f) -- the pad vanished in the last few ticks: take off again
+    end
+  end
 end
 
--- The "Show drones on the map" map setting shows or hides every drone dot.
 script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
-  if event.setting ~= "wp-long-haul-show-map-drones" then return end
-  local visible = show_map_dots()
-  for _, flight in pairs(storage.flights) do
-    if flight.map_dot and flight.map_dot.valid then flight.map_dot.visible = visible end
+  if not event.setting:find("^wp%-long%-haul%-") then return end
+  cfg = nil
+  local c = get_cfg()
+  if event.setting == "wp-long-haul-show-map-drones" then
+    for _, f in pairs(storage.flights) do
+      if f.mode then Flight.set_map_visible(f, c.map_dots) end
+    end
   end
 end)
 
@@ -1037,9 +951,9 @@ local function launch_next(data)
     return
   end
 
-  -- start_flight counts the drone as inbound; it was pre-counted when queued.
+  -- launch_flight counts the drone as inbound; it was pre-counted when queued.
   dest.inbound_drones = dest.inbound_drones - 1
-  start_flight(pad.surface, pad.position, dir_vector(data.direction), true, dest, job.cargo, job.kind)
+  launch_flight(data, dest, job.cargo, job.kind)
   pad.surface.play_sound({ path = "wp-long-haul-drone-launch", position = pad.position })
 end
 
@@ -1074,23 +988,6 @@ local function items_per_drone(name, force)
   return math.max(1, math.floor(payload / weight))
 end
 
-local function local_count(pad, item)
-  local network = pad.logistic_network
-  if not network then return 0 end
-  local in_network = network.get_item_count(item)
-  local in_pad = pad.get_inventory(defines.inventory.chest).get_item_count(item)
-  return math.max(0, in_network - in_pad)
-end
-
--- A pad can supply an item if it holds it and either doesn't request it or its
--- own network can top it back up. That stops two outposts ping-ponging stock.
-local function can_supply(pad, item, requested_here)
-  local have = pad.get_inventory(defines.inventory.chest).get_item_count(item)
-  if have <= 0 then return 0 end
-  if requested_here and local_count(pad, item) <= 0 then return 0 end
-  return have
-end
-
 local function requested_items(pad)
   local point = pad.get_requester_point()
   local result = {}
@@ -1103,17 +1000,17 @@ local function requested_items(pad)
   return result
 end
 
-local function request_lookup(pad)
-  local lookup = {}
-  for _, r in pairs(requested_items(pad)) do lookup[item_key(r.name, r.quality)] = true end
-  return lookup
-end
+--[[ Dispatching, once a second:
+  1. collect every unmet request from every pad ("needs"),
+  2. hand out drones one at a time, highest priority first. Within a priority,
+     pads take turns, and each pad's requests take turns, so a pad with ten
+     requests doesn't crowd out a pad with one, and a huge request doesn't
+     starve a small one. Starting points rotate each pass.
 
--- Dispatching happens in two steps so every pad gets served:
---   1. collect every unmet request from every pad ("needs"),
---   2. hand out drones one at a time, round-robin across the needs, highest
---      priority first. The starting point rotates each pass so no pad always
---      goes first.
+  Everything read from the game during a pass (inventories, logistic networks,
+  stock counts) is cached in `pass`, so a busy pass doesn't ask the game the
+  same question once per drone.
+]]
 
 local DEFAULT_PRIORITY = 50
 local MAX_PRIORITY = 255
@@ -1122,32 +1019,100 @@ local function pad_priority(data)
   return data.priority or DEFAULT_PRIORITY
 end
 
+local function new_pass()
+  return { inv = {}, net = {}, local_counts = {}, stock = {}, lookup = {} }
+end
+
+local function pass_inventory(pass, data)
+  local inv = pass.inv[data.id]
+  if not inv then
+    inv = data.entity.get_inventory(defines.inventory.chest)
+    pass.inv[data.id] = inv
+  end
+  return inv
+end
+
+local function pass_network(pass, data)
+  local net = pass.net[data.id]
+  if net == nil then
+    net = data.entity.logistic_network or false
+    pass.net[data.id] = net
+  end
+  return net
+end
+
+-- How many of an item the pad's own robot network holds outside the pad.
+local function local_count(pass, data, item, key)
+  local counts = pass.local_counts[data.id]
+  if not counts then
+    counts = {}
+    pass.local_counts[data.id] = counts
+  end
+  local count = counts[key]
+  if count == nil then
+    local net = pass_network(pass, data)
+    count = 0
+    if net then
+      count = math.max(0, net.get_item_count(item) - pass_inventory(pass, data).get_item_count(item))
+    end
+    counts[key] = count
+  end
+  return count
+end
+
+local function request_lookup(pass, data)
+  local lookup = pass.lookup[data.id]
+  if not lookup then
+    lookup = {}
+    for _, r in pairs(requested_items(data.entity)) do lookup[item_key(r.name, r.quality)] = true end
+    pass.lookup[data.id] = lookup
+  end
+  return lookup
+end
+
+-- What a pad can send of an item this pass. A pad supplies an item if it holds
+-- it and either doesn't request it or its own network can top it back up, which
+-- stops two outposts ping-ponging stock. Counted down as drones are loaded.
+local function stock_of(pass, data, item, key)
+  local stock = pass.stock[data.id]
+  if not stock then
+    stock = {}
+    pass.stock[data.id] = stock
+  end
+  local have = stock[key]
+  if have == nil then
+    have = pass_inventory(pass, data).get_item_count(item)
+    if have > 0 and request_lookup(pass, data)[key] and local_count(pass, data, item, key) <= 0 then have = 0 end
+    stock[key] = have
+  end
+  return have
+end
+
 -- What a pad still needs flown in for one request (0 if nothing).
-local function remote_shortfall(data, request)
-  local pad = data.entity
-  local item = { name = request.name, quality = request.quality }
-  local key = item_key(request.name, request.quality)
-  local have = pad.get_inventory(defines.inventory.chest).get_item_count(item)
+local function remote_shortfall(pass, data, request, item, key)
+  local have = pass_inventory(pass, data).get_item_count(item)
   -- Missing, counting cargo already in the air...
   local shortfall = request.count - have - (data.inbound[key] or 0)
   if shortfall <= 0 then return 0 end
   -- ...minus what local bots can bring from the pad's own network.
-  return math.max(0, shortfall - local_count(pad, item))
+  return math.max(0, shortfall - local_count(pass, data, item, key))
 end
 
 -- Nearest other pad, on another network, with a docked drone and stock to spare.
-local function find_supplier(need, candidates)
-  local requester = need.data.entity
+local function find_supplier(pass, need, candidates)
+  local requester = need.data
+  local requester_net = pass_network(pass, requester)
+  local here = requester.entity.position
   local best, best_dist, best_have
   for _, other in pairs(candidates) do
-    local pad = other.entity
-    if other ~= need.data and other.drones > 0
-      and (pad.logistic_network == nil or pad.logistic_network ~= requester.logistic_network) then
-      other.lookup = other.lookup or request_lookup(pad)
-      local have = can_supply(pad, need.item, other.lookup[need.key])
-      if have > 0 then
-        local dist = distance_sq(pad.position, requester.position)
-        if not best or dist < best_dist then best, best_dist, best_have = other, dist, have end
+    if other ~= requester and other.drones > 0 then
+      local net = pass_network(pass, other)
+      if not net or not requester_net or net ~= requester_net then
+        local have = stock_of(pass, other, need.item, need.key)
+        if have > 0 then
+          local dist = distance_sq(other.entity.position, here)
+          if not best or dist < best_dist then best, best_dist, best_have = other, dist, have end
+        end
       end
     end
   end
@@ -1155,8 +1120,8 @@ local function find_supplier(need, candidates)
 end
 
 -- Load one drone for a need. Returns true if a drone was sent.
-local function send_one_drone(need, candidates)
-  local supplier, have = find_supplier(need, candidates)
+local function send_one_drone(pass, need, candidates)
+  local supplier, have = find_supplier(pass, need, candidates)
   if not supplier then return false end
 
   local per_drone = items_per_drone(need.item.name, supplier.entity.force)
@@ -1171,10 +1136,14 @@ local function send_one_drone(need, candidates)
   end
 
   local count = math.min(need.load, per_drone, need.shortfall, have)
-  local removed = supplier.entity.get_inventory(defines.inventory.chest).remove({
+  local removed = pass_inventory(pass, supplier).remove({
     name = need.item.name, quality = need.item.quality, count = count,
   })
-  if removed <= 0 then return false end
+  if removed <= 0 then
+    pass.stock[supplier.id][need.key] = 0
+    return false
+  end
+  pass.stock[supplier.id][need.key] = have - removed
 
   queue_job(supplier, {
     dest_id = need.data.id,
@@ -1189,36 +1158,61 @@ local function send_one_drone(need, candidates)
   return true
 end
 
+-- Hand out drones within one priority level: pads take turns, and within a
+-- pad its requests take turns. One drone per pad per round, until no pad can
+-- get another one.
+local function serve_level(pass, pads, needs_by_pad, candidates, round)
+  local pad_offset = round % #pads
+  local cursor = {}
+  local progress = true
+  while progress do
+    progress = false
+    for n = 1, #pads do
+      local id = pads[(n + pad_offset - 1) % #pads + 1]
+      local list = needs_by_pad[id]
+      local start = cursor[id] or (round % #list)
+      for k = 0, #list - 1 do
+        local index = (start + k) % #list + 1
+        local need = list[index]
+        if need.shortfall > 0 and not need.stuck then
+          cursor[id] = index -- next turn starts with the request after this one
+          if send_one_drone(pass, need, candidates) then
+            progress = true
+            break
+          end
+          need.stuck = true -- nobody can supply it right now; try the pad's next request
+        end
+      end
+    end
+  end
+end
+
 local function dispatch_all()
   storage.dispatch_round = (storage.dispatch_round or 0) + 1
+  local round = storage.dispatch_round
+  local pass = new_pass()
 
-  -- Pads per surface (suppliers can only fly within a surface), and all needs.
+  -- Pads per surface (drones only fly within a surface), and every unmet need.
   local by_surface, needs_by_surface = {}, {}
   for _, data in pairs(storage.pads) do
     if data.entity.valid then
-      data.lookup = nil
       local index = data.entity.surface.index
       by_surface[index] = by_surface[index] or {}
       table.insert(by_surface[index], data)
       for _, request in pairs(requested_items(data.entity)) do
-        local shortfall = remote_shortfall(data, request)
+        local item = { name = request.name, quality = request.quality }
+        local key = item_key(request.name, request.quality)
+        local shortfall = remote_shortfall(pass, data, request, item, key)
         if shortfall > 0 then
           needs_by_surface[index] = needs_by_surface[index] or {}
-          table.insert(needs_by_surface[index], {
-            data = data,
-            item = { name = request.name, quality = request.quality },
-            key = item_key(request.name, request.quality),
-            shortfall = shortfall,
-          })
+          table.insert(needs_by_surface[index], { data = data, item = item, key = key, shortfall = shortfall })
         end
       end
     end
   end
 
   for index, needs in pairs(needs_by_surface) do
-    local candidates = by_surface[index]
-
-    -- Highest priority first; within a priority, a fixed order to rotate.
+    -- Highest priority first; within a priority, a fixed order to rotate through.
     table.sort(needs, function(a, b)
       local pa, pb = pad_priority(a.data), pad_priority(b.data)
       if pa ~= pb then return pa > pb end
@@ -1226,31 +1220,21 @@ local function dispatch_all()
       return a.key < b.key
     end)
 
-    -- Walk each priority level, one drone per need per round, until stuck.
     local i = 1
     while i <= #needs do
       local level = pad_priority(needs[i].data)
-      local group = {}
+      local pads, needs_by_pad = {}, {}
       while i <= #needs and pad_priority(needs[i].data) == level do
-        group[#group + 1] = needs[i]
+        local need = needs[i]
+        local id = need.data.id
+        if not needs_by_pad[id] then
+          needs_by_pad[id] = {}
+          pads[#pads + 1] = id
+        end
+        table.insert(needs_by_pad[id], need)
         i = i + 1
       end
-
-      local offset = storage.dispatch_round % #group
-      local progress = true
-      while progress do
-        progress = false
-        for n = 1, #group do
-          local need = group[(n + offset - 1) % #group + 1]
-          if need.shortfall > 0 and not need.stuck then
-            if send_one_drone(need, candidates) then
-              progress = true
-            else
-              need.stuck = true
-            end
-          end
-        end
-      end
+      serve_level(pass, pads, needs_by_pad, by_surface[index], round)
     end
   end
 end
@@ -1511,7 +1495,9 @@ script.on_event(defines.events.on_tick, function(event)
   if next(storage.launching) then process_launches(tick) end
   if next(storage.flights) then
     update_flights(tick)
-    if tick % SOUND_INTERVAL == 0 then play_flying_sounds() end
+    if tick % SOUND_INTERVAL == 0 then
+      Flight.play_sounds(storage.flights, "wp-long-haul-drone-flying", SOUND_RANGE, MAX_SOUNDS)
+    end
   end
 end)
 
@@ -1576,9 +1562,14 @@ script.on_nth_tick(30, function(event)
     end
   end
 
+  local open_pads = {}
+  for _, id in pairs(storage.open) do open_pads[id] = true end
+  local full_check = event.tick % 300 == 0
+
   for _, data in pairs(storage.pads) do
     if data.entity.valid then
-      strip_drone_requests(data)
+      -- Drone requests: checked every 5 s, or every 0.5 s while the pad's panel is open.
+      if full_check or open_pads[data.id] then strip_drone_requests(data) end
       absorb_drones(data)
       if data.spike_until and event.tick >= data.spike_until then
         if data.power and data.power.valid then data.power.power_usage = POWER_IDLE end

@@ -191,14 +191,14 @@ data:extend({
   },
 })
 
--- Flying drones: 64 headings each, clockwise from north. The script picks the
--- frame for the drone's heading (animation_speed 0 + animation_offset).
-for variant, sheet in pairs(drone_sprites) do
-  data:extend({
+-- Flying drones: 64 headings each, clockwise from north. The flight library
+-- picks the frame for the drone's heading (animation_speed 0 + animation_offset).
+local function drone_animations(name, file, sheet)
+  return {
     {
       type = "animation",
-      name = "wp-long-haul-drone-" .. variant,
-      filename = GFX .. "wp-long-haul-drone-" .. variant .. ".png",
+      name = name,
+      filename = GFX .. file .. ".png",
       width = sheet.diffuse.width,
       height = sheet.diffuse.height,
       frame_count = sheet.diffuse.direction_count,
@@ -208,8 +208,8 @@ for variant, sheet in pairs(drone_sprites) do
     },
     {
       type = "animation",
-      name = "wp-long-haul-drone-" .. variant .. "-shadow",
-      filename = GFX .. "wp-long-haul-drone-" .. variant .. "-shadow.png",
+      name = name .. "-shadow",
+      filename = GFX .. file .. "-shadow.png",
       width = sheet.shadow.width,
       height = sheet.shadow.height,
       frame_count = sheet.shadow.direction_count,
@@ -218,8 +218,33 @@ for variant, sheet in pairs(drone_sprites) do
       scale = 0.5,
       draw_as_shadow = true,
     },
-  })
+  }
 end
+
+local bank_counts = {}
+for variant, sheet in pairs(drone_sprites) do
+  -- Level flight (used when there are no rendered bank frames).
+  data:extend(drone_animations("wp-long-haul-drone-" .. variant, "wp-long-haul-drone-" .. variant, sheet))
+
+  -- Rendered bank frames, if they're in the mod, packed with
+  -- tools/pack_drone_sprites.py into graphics/entity/drone-<variant>/:
+  --   --name wp-long-haul-drone-<variant> --split-banks 5 --hull ... --shadow ...
+  -- Its drone-animations.lua adds "wp-long-haul-drone-<variant>-hull-<n>" and
+  -- "-shadow-<n>" (bank 0 = hard left ... last = hard right), the names the
+  -- flight library's split_banks mode looks for.
+  pcall(require, "graphics.entity.drone-" .. variant .. ".drone-animations")
+  local n = 0
+  while data.raw.animation["wp-long-haul-drone-" .. variant .. "-hull-" .. n]
+    and data.raw.animation["wp-long-haul-drone-" .. variant .. "-shadow-" .. n] do
+    n = n + 1
+  end
+  bank_counts[variant] = n
+end
+
+-- Tell control.lua how many bank frames there are (it can't look up animations).
+-- Both variants need the same count, or banking falls back to the squeeze trick.
+local banks = (bank_counts.loaded == bank_counts.unloaded and bank_counts.loaded > 1) and bank_counts.loaded or 1
+data:extend({ { type = "mod-data", name = "wp-long-haul", data = { banks = banks } } })
 
 -- Sounds (from Radar Probe Drone Launcher for now).
 data:extend({

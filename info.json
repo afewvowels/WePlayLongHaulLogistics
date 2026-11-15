@@ -1,11 +1,12 @@
 {
   "name": "WePlayLongHaulLogistics",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "title": "WePlay: Long Haul Logistics Drones",
   "author": "afewvowels",
   "factorio_version": "2.1",
   "dependencies": [
-    "base >= 2.1"
+    "base >= 2.1",
+    "WePlayFlightLib >= 0.1.6"
   ],
   "description": "A logistics network with no coverage map: swarms of cargo airplanes link your outposts to your main base. An alternative to trains for long distance transportation."
 }

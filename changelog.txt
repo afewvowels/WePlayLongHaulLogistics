@@ -1,4 +1,19 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2026-11-15
+  Features:
+    - Alt-mode icons on loaded drones show what they're carrying, with a quality badge for non-normal quality.
+    - New map setting "Maximum launch pads per force" (default 10, 0 = no limit).
+    - New map setting "Separate arrivals and departures" (on by default): drones turn right after takeoff and before landing, so arriving and departing drones use opposite sides of each pad instead of flying on top of each other.
+    - Ready for rendered bank frames: pack them with pack_drone_sprites.py into graphics/entity/drone-loaded and drone-unloaded, and banking switches from the squeeze trick to real frames automatically.
+  Changes:
+    - Flying now uses WePlay: Flight Library 0.1.6 or newer (new dependency).
+    - Fair dispatch now takes turns between pads first, then between each pad's requests, so a pad with many requests can't crowd out a pad with one.
+  Optimizations:
+    - Drones far from every player are hidden and not redrawn each tick.
+    - Dispatch reads each pad's inventory, robot network and stock once per pass instead of once per drone.
+    - Settings are read once instead of every tick, and drone requests are checked less often.
+---------------------------------------------------------------------------------------------------
 Version: 1.0.2
 Date: 2026-11-12
   Features:

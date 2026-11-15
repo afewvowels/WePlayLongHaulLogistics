@@ -1,0 +1,5 @@
+# Release zips and raw renders stay out of the repo
+*.zip
+renders/
+*.blend1
+__pycache__/
