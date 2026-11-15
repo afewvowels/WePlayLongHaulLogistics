@@ -1,5 +1,13 @@
-# Release zips and raw renders stay out of the repo
+# Working copy of the mod (the real files live at the top level of the repo)
+/WePlayLongHaulLogistics/
+/WePlayLongHaulLogistics_*/
+
+# Release zips
 *.zip
+
+# Raw renders and Blender backups
 renders/
 *.blend1
+
+# Python cache from the packing scripts
 __pycache__/
